@@ -89,7 +89,8 @@ public:
     odom_frame_(declare_parameter("odom_frame", "odom")),
     base_frame_(declare_parameter("base_frame", "pelvis")),
     imu_frame_(declare_parameter("imu_frame", "livox_imu")),
-    clock_offset_(declare_parameter("clock_offset_window", 2.0))
+    offset_window_ns_(static_cast<int64_t>(declare_parameter("clock_offset_window", 2.0) * 1e9)),
+    clock_offset_(offset_window_ns_ * 1e-9)
   {
     js_pub_ = create_publisher<sensor_msgs::msg::JointState>("joint_states", 10);
     odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("g1/odom", 10);
@@ -123,7 +124,7 @@ private:
     if (stamp != 0) {
       clock_offset_.add(receive_ns, stamp);
       host_ns = *clock_offset_.to_host_ns(stamp);
-      log_offset();
+      log_offset(receive_ns);
     }
     msg->header.stamp = rclcpp::Time(host_ns, RCL_ROS_TIME);
     // The MID-360 IMU publishes no frame_id and no orientation (all-zero quaternion); acceleration is
@@ -145,8 +146,15 @@ private:
     cloud_pub_->publish(std::move(msg));
   }
 
-  void log_offset()
+  void log_offset(int64_t receive_ns)
   {
+    // The first samples after startup arrive late (burst): the minimum settles within one window. Report from then on.
+    if (!first_receive_ns_) {
+      first_receive_ns_ = receive_ns;
+    }
+    if (receive_ns - *first_receive_ns_ < offset_window_ns_) {
+      return;
+    }
     const int64_t off = *clock_offset_.offset_ns();
     if (!logged_offset_ns_ || std::llabs(off - *logged_offset_ns_) > 50000000LL) {
       RCLCPP_INFO(get_logger(), "%s host - robot = %+.3f s",
@@ -230,7 +238,9 @@ private:
   const std::string odom_frame_;
   const std::string base_frame_;
   const std::string imu_frame_;
+  const int64_t offset_window_ns_;
   ClockOffset clock_offset_;
+  std::optional<int64_t> first_receive_ns_;
   std::optional<int64_t> logged_offset_ns_;
   int64_t last_js_ns_{0};
   int64_t last_odom_ns_{0};

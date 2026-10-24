@@ -47,3 +47,12 @@ F1–F3 (description, TF/joints, lidar + IMU relay) done and verified offline on
 - CPU (walking bag, standalone bridge): 45 % → 5 % of a core; container incl. robot_state_publisher ≈ 6 %.
 - check_live [CPU] matches argv[0] (shells mentioning the names were counted). RViz: docs/rviz_bringup_walking.png.
 - Python bridge removed (copy in /tmp/claude-1000/py_bridge_backup until reboot; no git yet).
+
+### 2026-10-24 — F4: live robot check passes (+ three fixes)
+- Fixes found while doing the same work in go2_deployment: init.sh no longer masks a failing clock-offset test
+  (`$(python … | grep)` returned grep's status); robot-mode setup.zsh exports ROS_DOMAIN_ID=0 (an inherited offline
+  domain hid every robot topic on the Go2); the bridge logs the offset once a 2 s window is full (the startup burst
+  printed a false "clock offset JUMPED").
+- This host's Claude Code session inherits G1_DDS=loopback / ROS_DOMAIN_ID=91: robot runs need `G1_DDS=robot`.
+- `G1_DDS=robot ./init.sh --robot` passes: all rates (cloud 10.0 Hz, imu 200.0 Hz), all TF chains, cloud receipt −
+  stamp 101.0 ms, imu 0.4 ms, g1_container 7.0 % of a core, clock offset +1970.836 s (bags: 1969.2, 1970.3).

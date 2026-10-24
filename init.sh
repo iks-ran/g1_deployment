@@ -31,8 +31,8 @@ python3 -m py_compile src/g1_bringup/launch/*.py \
   src/g1_description/launch/*.py scripts/*.py
 
 echo "== clock offset: robot lidar/IMU stamps -> host time (recorded bags, no DDS)"
-out=$(python3 scripts/test_clock_offset.py 2>&1 | grep -v INFO) || { echo $out; exit 1 }
-echo $out
+out=$(python3 scripts/test_clock_offset.py 2>&1) || { echo $out | grep -v INFO; exit 1 }
+echo $out | grep -v INFO
 
 echo "== bringup on the recorded bags (isolated loopback DDS domain; skipped without bags/)"
 for b in run_2026-10-24_2052 run_2026-10-24_2147; do   # suspended, walking

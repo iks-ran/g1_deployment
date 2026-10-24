@@ -31,10 +31,10 @@
       "id": "F4",
       "name": "Live robot check (init.sh --robot)",
       "description": "Same rates/TF check against the real G1 over the robot NIC.",
-      "status": "todo",
+      "status": "done",
       "dependencies": ["F3"],
       "done_when": "./init.sh --robot passes with the robot connected",
-      "evidence": ""
+      "evidence": "2026-10-24: G1_DDS=robot ./init.sh --robot passes: /joint_states 95.8 Hz, /tf 108.6, /g1/odom 89.4, /g1/cloud 10.0, /g1/imu 200.0; all TF chains; cloud receipt - stamp 101.0 ms, imu 0.4 ms; g1_container 7.0 % of a core; clock offset +1970.836 s"
     },
     {
       "id": "F5",

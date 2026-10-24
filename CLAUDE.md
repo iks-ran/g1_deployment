@@ -47,10 +47,14 @@ Also present: /secondary_imu (torso IMU, unitree_hg/IMUState), /ele_clouds, /dog
 - `~/workspaces/unitree_ros2` is READ-ONLY. Never write there.
 - DDS: with only the robot NIC configured, multicast does not loop back on this host → `setup.zsh` adds a self
   unicast peer + `AllowMulticast=spdp` (same as go2). Default NIC `enx3c18a0d80cff`, override with `G1_IFACE`.
+- The robot publishes on DDS domain 0: robot-mode `setup.zsh` exports `ROS_DOMAIN_ID=${G1_ROBOT_DOMAIN:-0}` (a leftover
+  offline domain hides every robot topic with no error). `G1_DDS` is read from the environment: a shell that inherited
+  `G1_DDS=loopback` stays offline even for `./init.sh --robot` — use `G1_DDS=robot ./init.sh --robot`.
 - Robot clock ≠ host clock (host − robot ≈ +1969 s on 2026-10-24, +1.1 s between bags 55 min apart: it drifts).
   Never forward raw robot stamps, and never restamp lidar data on receipt: the cloud stamp is the scan START
   (per-point `time` 0..100 ms), ~100 ms before it arrives. `state_bridge` converts lidar/IMU stamps with
-  `ClockOffset` (lower envelope of receipt − stamp of the 200 Hz lidar IMU over 2 s; IMU latency ≈ 0.25 ms).
+  `ClockOffset` (lower envelope of receipt − stamp of the 200 Hz lidar IMU over 2 s; IMU latency ≈ 0.25 ms); the
+  offset is logged once the first 2 s window is full (the startup burst is late), then only on real jumps.
   /lowstate and /odommodestate have no usable stamp (SportModeState.stamp = 0): stamped on receipt.
 - Bridge CPU (walking bag replay): Python was 45 % of a core (/lowstate decode 36 %, /odommodestate 12 %); the C++
   component is 5 % (lowstate 3, odom 2, cloud 1, IMU 0); container with robot_state_publisher ≈ 6 %.

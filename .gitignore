@@ -1,0 +1,10 @@
+build/
+install/
+log/
+__pycache__/
+# recordings (~2 GB) and their archives: not in git
+bags/
+*.zip
+# top-level dotfiles/dirs (editor state: .vscode holds a ~1.4 GB browse db, .claude, .idea, shell rc mounts)
+/.*
+!/.gitignore

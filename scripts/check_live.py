@@ -33,11 +33,21 @@ TOPICS = {
     '/g1/cloud': (PointCloud2, QoSProfile(depth=2, reliability=ReliabilityPolicy.RELIABLE), 8.0),
     '/g1/imu': (Imu, qos_profile_sensor_data, 150.0),
 }
+# Checked in a second window, alone: two ~440 KB cloud streams into this one process overflow the default 208 KB
+# UDP receive buffer on loopback (see STAMP_AGE_MS) and cost whole clouds (7.7 Hz). The bridge publishes the
+# deskewed cloud only while subscribed, so the first window sees exactly the raw-only load.
+LATER_TOPICS = {
+    '/g1/cloud_deskewed': (PointCloud2, QoSProfile(depth=2, reliability=ReliabilityPolicy.RELIABLE), 8.0),
+}
 TF_CHAINS = [('odom', 'livox_imu'), ('odom', 'left_ankle_roll_link'), ('pelvis', 'right_wrist_yaw_link'),
              ('odom', 'robot_center')]
 # Robot stamps converted to host time (state_bridge clock offset): receipt here - stamp. The cloud's stamp is the
 # scan START (scan = 100 ms); the IMU is stamped at measurement. 0 ms for the cloud = stamped on receipt (old bug).
-STAMP_AGE_MS = {'/g1/cloud': (80.0, 200.0), '/g1/imu': (0.0, 30.0)}
+# Checked on the 10th percentile: transport only adds delay. On loopback (bag gate) a ~440 KB cloud overflows the
+# default 208 KB UDP receive buffer (net.core.rmem_max), and a Reliable reader gets the lost fragment repaired on the
+# next heartbeat (100 ms): measured 5 % of UDP packets dropped and medians of ~200 ms with two cloud topics.
+# /g1/cloud_deskewed is stamped at the scan END (FAST-LIO2 convention) and waits up to 50 ms for gyro + TF.
+STAMP_AGE_MS = {'/g1/cloud': (80.0, 200.0), '/g1/cloud_deskewed': (0.0, 80.0), '/g1/imu': (0.0, 30.0)}
 # Processes whose CPU is reported: label -> (argv[0] suffix, required argument). g1.launch.py runs bridge +
 # robot_state_publisher in one container; the standalone executables are for profiling the bridge alone.
 # Match argv[0], not the whole cmdline: shells whose command text merely mentions these must not count.
@@ -107,7 +117,7 @@ def run(warmup=4.0, window=5.0, floor=False):
     node = Node('g1_check_live')
     buf = Buffer()
     TransformListener(buf, node)
-    counts = {t: 0 for t in TOPICS}
+    counts = {t: 0 for t in {**TOPICS, **LATER_TOPICS}}
     last = {}
     ages = {t: [] for t in STAMP_AGE_MS}
 
@@ -118,8 +128,8 @@ def run(warmup=4.0, window=5.0, floor=False):
             if topic in ages:
                 ages[topic].append((node.get_clock().now() - Time.from_msg(msg.header.stamp)).nanoseconds * 1e-6)
         return cb
-    for topic, (msg_type, qos, _) in TOPICS.items():
-        node.create_subscription(msg_type, topic, make_cb(topic), qos)
+    subs = {topic: node.create_subscription(msg_type, topic, make_cb(topic), qos)
+            for topic, (msg_type, qos, _) in TOPICS.items()}
 
     def spin_for(sec):
         end = time.time() + sec
@@ -131,29 +141,48 @@ def run(warmup=4.0, window=5.0, floor=False):
     cpu0 = cpu_ticks()
     spin_for(window)
     cpu1 = cpu_ticks()
+    node.destroy_subscription(subs['/g1/cloud'])
+    for topic, (msg_type, qos, _) in LATER_TOPICS.items():
+        node.create_subscription(msg_type, topic, make_cb(topic), qos)
+    spin_for(1.0)
+    later = {t: counts[t] for t in LATER_TOPICS}
+    cpu2 = cpu_ticks()
+    spin_for(3.0)
+    cpu3 = cpu_ticks()
+    later = {t: (counts[t] - later[t]) / 3.0 for t in LATER_TOPICS}
 
     ok = True
     hz = os.sysconf('SC_CLK_TCK')
     for (pid, name), t1 in sorted(cpu1.items(), key=lambda kv: kv[0][1]):
         if (pid, name) in cpu0:  # informational (no threshold): bridge cost on the robot vs the bag
             print(f"[CPU] {name:28s} {100 * (t1 - cpu0[(pid, name)]) / hz / window:5.1f} % of one core")
-    for topic, (_, _, min_hz) in TOPICS.items():
-        hz = counts[topic] / window
+    for (pid, name), t3 in sorted(cpu3.items(), key=lambda kv: kv[0][1]):
+        if (pid, name) in cpu2:
+            print(f"[CPU] {name + ' + deskew':28s} {100 * (t3 - cpu2[(pid, name)]) / hz / 3.0:5.1f} % of one core")
+    for topic, (_, _, min_hz) in {**TOPICS, **LATER_TOPICS}.items():
+        hz = later[topic] if topic in later else counts[topic] / window
         ok &= hz >= min_hz
         print(f"[{'OK ' if hz >= min_hz else 'LOW'}] {topic:28s} {hz:7.1f} Hz (min {min_hz})")
     for parent, child in TF_CHAINS:
         good = buf.can_transform(parent, child, Time())
         ok &= good
         print(f"[{'OK ' if good else 'BAD'}] TF {parent} -> {child}")
+    desk = last.get('/g1/cloud_deskewed')
+    fields = [(f.name, f.offset, f.datatype) for f in desk.fields] if desk else None
+    good = fields == [('x', 0, 7), ('y', 4, 7), ('z', 8, 7), ('intensity', 12, 7)] and desk.point_step == 16
+    ok &= good
+    print(f"[{'OK ' if good else 'BAD'}] /g1/cloud_deskewed fields x y z intensity (float32, 16 B): "
+          f"{[f[0] for f in fields] if fields else None}")
     imu = last.get('/g1/imu')
     good = imu is not None and imu.header.frame_id == 'livox_imu'
     ok &= good
     print(f"[{'OK ' if good else 'BAD'}] /g1/imu frame_id {imu.header.frame_id if imu else None!r}")
     for topic, (lo, hi) in STAMP_AGE_MS.items():
-        med = float(np.median(ages[topic])) if ages[topic] else float('nan')
-        good = lo <= med <= hi
+        p10, med = np.percentile(ages[topic], [10, 50]) if ages[topic] else (float('nan'),) * 2
+        good = lo <= p10 <= hi
         ok &= good
-        print(f"[{'OK ' if good else 'BAD'}] {topic} receipt - stamp median {med:6.1f} ms (expect {lo}..{hi})")
+        print(f"[{'OK ' if good else 'BAD'}] {topic} receipt - stamp p10 {p10:6.1f} ms (expect {lo}..{hi}), "
+              f"median {med:6.1f}")
     if floor:
         good, text = floor_check(node, buf, last['/g1/cloud']) if '/g1/cloud' in last else (False, 'no cloud')
         ok &= good

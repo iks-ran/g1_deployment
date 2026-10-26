@@ -14,7 +14,9 @@
       "name": "TF tree: odom->pelvis from /odommodestate + 29 joints from /lowstate",
       "description": "state_bridge, host-restamped, throttled to 100 Hz; /g1/odom with body-frame twist.",
       "status": "done",
-      "dependencies": ["F1"],
+      "dependencies": [
+        "F1"
+      ],
       "done_when": "TF odom->left_ankle_roll_link and pelvis->right_wrist_yaw_link resolve; /joint_states >= 50 Hz",
       "evidence": "2026-10-24 bag replay: /joint_states 95 Hz, /tf 109 Hz, /g1/odom 90 Hz, all TF chains OK"
     },
@@ -23,7 +25,9 @@
       "name": "MID-360 lidar + IMU relay aligned with the URDF",
       "description": "/g1/cloud (livox_frame, Reliable), /g1/imu (frame livox_imu, orientation marked absent).",
       "status": "done",
-      "dependencies": ["F2"],
+      "dependencies": [
+        "F2"
+      ],
       "done_when": "lidar floor in odom within 5 cm of the URDF sole height; cloud >= 8 Hz",
       "evidence": "2026-10-24 bag replay: /g1/cloud 9.5 Hz, /g1/imu 197 Hz; mount rotation: torso-IMU vs lidar-IMU gravity fit pitch 2.93 deg (= URDF), residual 0.04 deg; floor tilt <= 0.3 deg. Height unverified: robot suspended, floor +1.0 cm above soles (error ~1 cm + gap)"
     },
@@ -32,7 +36,9 @@
       "name": "Live robot check (init.sh --robot)",
       "description": "Same rates/TF check against the real G1 over the robot NIC.",
       "status": "done",
-      "dependencies": ["F3"],
+      "dependencies": [
+        "F3"
+      ],
       "done_when": "./init.sh --robot passes with the robot connected",
       "evidence": "2026-10-24: G1_DDS=robot ./init.sh --robot passes: /joint_states 95.8 Hz, /tf 108.6, /g1/odom 89.4, /g1/cloud 10.0, /g1/imu 200.0; all TF chains; cloud receipt - stamp 101.0 ms, imu 0.4 ms; g1_container 7.0 % of a core; clock offset +1970.836 s"
     },
@@ -41,7 +47,9 @@
       "name": "Verify lidar extrinsics (height + rotation) on a robot on flat ground",
       "description": "Record a short bag (same topics) with the G1 standing on flat floor; check_live --floor should give ~0 cm.",
       "status": "done",
-      "dependencies": ["F3"],
+      "dependencies": [
+        "F3"
+      ],
       "done_when": "floor vs URDF sole within 1-2 cm on a standing bag (or within 1 cm of -gap with a measured gap)",
       "evidence": "2026-10-24 walking bag run_2026-10-24_2147: clear floor ahead -0.2..+0.5 cm from the stance foot (1-3.5 m); gyro mount fit pitch 2.911+-0.05 deg (URDF 2.93); other sectors rise with distance in all directions = environment, not a rigid error (scripts/floor_sectors.py)"
     },
@@ -50,7 +58,9 @@
       "name": "Lidar/IMU stamps: robot clock converted to host time (no restamp on receipt)",
       "description": "ClockOffset (lower envelope of receipt - stamp of the lidar IMU, 2 s window) in state_bridge; cloud keeps its scan-start stamp.",
       "status": "done",
-      "dependencies": ["F3"],
+      "dependencies": [
+        "F3"
+      ],
       "done_when": "test_clock_offset passes on both bags; live/bag pipeline: /g1/cloud receipt - stamp ~100 ms, /g1/imu ~0",
       "evidence": "2026-10-24: IMU latency median 0.25 ms (p1 +0.03..0.05); cloud receipt - stamp 100.3 ms (bags), 103 ms through the bag pipeline; walking bag floor-height scatter 1.21 -> 1.06 cm"
     },
@@ -59,9 +69,23 @@
       "name": "C++ bridge component (replaces the Python state_bridge)",
       "description": "g1_bringup -> ament_cmake: StateBridge component + clock_offset.hpp; g1.launch runs it with robot_state_publisher in one container.",
       "status": "done",
-      "dependencies": ["F6"],
+      "dependencies": [
+        "F6"
+      ],
       "done_when": "init.sh passes on both bags with identical checks; CPU well below the Python bridge; RViz OK",
       "evidence": "2026-10-24: clock offset results identical to Python (IMU 0.25 ms, cloud 100.3 ms); bag gate all OK (cloud 103 ms, floor -1.1 cm); standalone bridge CPU 5 % vs 45 % (lowstate 3 vs 36); container 6 %; docs/rviz_bringup_walking.png"
+    },
+    {
+      "id": "F8",
+      "name": "Deskewed cloud /g1/cloud_deskewed (gyro rotation + leg-odometry translation, FAST-LIO2 convention)",
+      "description": "The robot cloud is raw. state_bridge moves every point into the lidar frame at the scan END (stamp = scan end, fields x y z intensity, like FAST-LIO2): rotation integrated from the MID-360 gyro, translation of the lidar origin from TF odom -> livox_frame (leg odometry + waist joints). Waits for gyro + TF coverage (<= 50 ms). /g1/cloud stays raw (for LIO).",
+      "status": "done",
+      "dependencies": [
+        "F6",
+        "F7"
+      ],
+      "done_when": "C++ = NumPy reference (< 0.5 mm); ground-truth error on synthetic data well below rotation-only; pipeline output = independent reconstruction (mm); init.sh passes; RViz checked",
+      "evidence": "2026-10-26: test_deskew: C++ = NumPy reference 0.001 mm (scan-end frame + translation), turning half-NN 12.09 -> 10.20 cm. sim_deskew_bench (C++ via deskew_check vs ground truth): median/p95 raw 4.07/13.15 cm, gyro rot 0.82/1.54, C++ gyro rot + leg trans 0.39/0.65 (2x speed 0.46/0.87; with 8 ms gyro delay + 25 ms leg lag 0.62/1.38); oracle 0.00. Pipeline (bag replay + g1.launch) vs independent reconstruction (odommodestate + URDF waist FK in Python): 0.6 mm median (0.9 moving, p95 3.3) vs 18.9 mm rotation-only, 38 mm sign-flipped. Bag gate: 10.0 Hz, stamp age p10 11 / median 30 ms, fields OK; container 6.3 -> 7.7 % with deskew; docs/rviz_deskewed_walking.png. Not yet run on the robot."
     }
   ]
 }

@@ -34,6 +34,10 @@ echo "== clock offset: robot lidar/IMU stamps -> host time (recorded bags, no DD
 out=$(python3 scripts/test_clock_offset.py 2>&1) || { echo $out | grep -v INFO; exit 1 }
 echo $out | grep -v INFO
 
+echo "== deskew: C++ deskew (gyro rotation + translation, scan end) vs NumPy reference (walking bag, no DDS)"
+out=$(python3 scripts/test_deskew.py 2>&1) || { echo $out | grep -v INFO; exit 1 }
+echo $out | grep -v INFO
+
 echo "== bringup on the recorded bags (isolated loopback DDS domain; skipped without bags/)"
 for b in run_2026-10-24_2052 run_2026-10-24_2147; do   # suspended, walking
   out=$(python3 scripts/test_bag_bringup.py bags/$b) || { echo $out; exit 1 }

@@ -41,8 +41,30 @@ Visualization Manager:
       Show Names: false
       Value: false
     - Class: rviz_default_plugins/PointCloud2
-      Name: Lidar (/g1/cloud, livox_frame)
+      Name: Lidar deskewed (/g1/cloud_deskewed)
       Enabled: true
+      Topic:
+        Value: /g1/cloud_deskewed
+        Depth: 1
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+      Style: Points
+      Size (Pixels): 2
+      Size (m): 0.03
+      Color Transformer: AxisColor
+      Axis: Z
+      Use Fixed Frame: true
+      Autocompute Value Bounds:
+        Value: true
+      Decay Time: 0
+      Alpha: 0.6
+      Position Transformer: XYZ
+      Selectable: true
+      Value: true
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Lidar (/g1/cloud, livox_frame)
+      Enabled: false
       Topic:
         Value: /g1/cloud
         Depth: 1
@@ -61,7 +83,7 @@ Visualization Manager:
       Alpha: 0.6
       Position Transformer: XYZ
       Selectable: true
-      Value: true
+      Value: false
     - Class: rviz_default_plugins/Odometry
       Name: Odometry (/g1/odom)
       Enabled: false

@@ -15,7 +15,9 @@ ROS 2 Humble workspace for the Unitree G1 (29 DoF, rev 1.0): URDF, TF tree, MID-
   Edit only the appended block (`init.sh` diffs the rest against upstream). `meshes/` = the 35 STLs it references.
 - `src/g1_bringup/` (ament_cmake, C++) — `src/state_bridge.cpp`: component `g1_bringup::StateBridge`
   (/lowstate → /joint_states, /odommodestate → TF odom→pelvis + /g1/odom, lidar/IMU relay to /g1/cloud, /g1/imu with
-  robot stamps converted to host time; also a standalone `state_bridge` executable for profiling),
+  robot stamps converted to host time; /g1/cloud_deskewed; also a standalone `state_bridge` executable for profiling),
+  `include/g1_bringup/deskew.hpp` (deskew to the scan end: gyro rotation + leg-odometry translation),
+  `src/deskew_check.cpp` (stdin driver),
   `include/g1_bringup/clock_offset.hpp` (robot→host clock offset), `src/clock_offset_check.cpp` (stdin driver for
   the offset test), `launch/g1.launch.py` (bridge + robot_state_publisher in container `g1_container`),
   `rviz/g1.rviz` (the ONLY RViz config).
@@ -28,6 +30,9 @@ ROS 2 Humble workspace for the Unitree G1 (29 DoF, rev 1.0): URDF, TF tree, MID-
 - `scripts/check_mount_imu.py` — lidar mount rotation from torso-IMU vs MID-360-IMU gravity (still windows).
 - `scripts/check_mount_gyro.py` — full mount rotation from both gyros (walking bag; the strongest check).
 - `scripts/floor_sectors.py` — lidar floor minus lowest foot, per sector × distance (walking bag).
+- `scripts/test_deskew.py [bag]` — offline (no DDS) test of the C++ deskew on the walking bag (via deskew_check).
+- `scripts/sim_deskew_bench.py [bag] [--speed --gyro-delay-ms --leg-lag-ms]` — synthetic deskew benchmark with ground
+  truth (real lidar trajectory + real MID-360 scan pattern ray-traced in a box room; gyro / leg-odometry models).
 - `scripts/test_bag_bringup.py [bag]` — offline gate: bag replay + g1.launch + check_live --floor (loopback domain 92);
   init.sh runs it on both bags.
 - `scripts/dds_loopback.zsh` — offline DDS vars (lo, domain 91). `scripts/winshot.zsh` — RViz screenshot.
@@ -60,6 +65,23 @@ Also present: /secondary_imu (torso IMU, unitree_hg/IMUState), /ele_clouds, /dog
   component is 5 % (lowstate 3, odom 2, cloud 1, IMU 0); container with robot_state_publisher ≈ 6 %.
 - No intra-process comms in g1_container: Humble allows it only for volatile topics; robot_state_publisher's
   /tf_static and /robot_description are transient local → its constructor throws ("allowed only with volatile").
+- The robot's cloud is RAW (no motion compensation: verified, deskew with the gyro is optimal at gain 1). Per-point
+  `time` is float32 **ns** after the stamp. /g1/cloud stays raw (LIO deskews itself). /g1/cloud_deskewed (only while
+  subscribed) follows FAST-LIO2: every point in livox_frame at the scan END, stamp = scan end, fields x y z intensity
+  (float32, 16 B). Rotation from the MID-360 gyro (same clock as the points), translation of the lidar origin from leg
+  odometry via TF odom → livox_frame (5 ms samples). Waits for gyro + TF to cover the scan end (≤ 50 ms; arrives
+  ~30 ms after the scan end), else deskews with what is there. Leg odometry alone is worse (its rotation, 25 ms lag).
+  Synthetic ground truth: median/p95 error raw 4.1/13.2 cm → 0.39/0.65 cm (rotation only: 0.82/1.54).
+- The robot does no lidar odometry: /odommodestate (= /dog_odom) is proprioceptive (IMU + legs): yaw drifts 0.3°/min
+  while hanging (lidar: 0), 1.9° / 3 cm vs lidar ICP over an 11 m walk; its z is held near nominal height.
+  SportModeState.imu_state.gyroscope is all ZERO. /slam_info is telemetry JSON, not a pose.
+- Timing vs the MID-360 gyro (walking bag, |w| cross-correlation): torso IMU (/secondary_imu) arrives 8 ms BEFORE the
+  gyro's stamp says it happened (corr 0.98), /lowstate pelvis IMU and /odommodestate −23/−25 ms. Irrelevant for
+  deskew (metric flat over ±20 ms), not yet resolved for cloud-vs-TF alignment.
+- Host UDP buffer: net.core.rmem_max = 208 KB (default) < one cloud. Over the robot cable it is fine; on loopback
+  (bag gate) a Reliable reader of large clouds loses fragments (5 % of UDP packets) and gets them repaired on the
+  next heartbeat → +100/200 ms. check_live checks stamp age on the 10th percentile and reads /g1/cloud_deskewed in
+  a separate window (both clouds at once in one process: 7.7 Hz).
 - The lidar cloud (~440 KB) must be read with RELIABLE QoS: a best-effort reader loses whole samples on one dropped
   fragment (bag replay on lo: 0 Hz best effort vs 9.3 Hz reliable). RViz and check_live read /g1/cloud Reliable.
 - Lidar extrinsics: upstream `mid360_joint` (torso_link, z 0.4284, rpy π, 0.0511, 0) — MID-360 is upside down.

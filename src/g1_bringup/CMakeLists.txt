@@ -35,7 +35,13 @@ target_compile_features(clock_offset_check PRIVATE cxx_std_17)
 
 install(TARGETS state_bridge_component
   ARCHIVE DESTINATION lib LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
-install(TARGETS clock_offset_check DESTINATION lib/${PROJECT_NAME})
+# Feeds bag IMU samples + clouds through deskew_rotation(): lets scripts/test_deskew.py test the C++ code on bags.
+add_executable(deskew_check src/deskew_check.cpp)
+target_include_directories(deskew_check PRIVATE include)
+target_compile_features(deskew_check PRIVATE cxx_std_17)
+ament_target_dependencies(deskew_check sensor_msgs)
+
+install(TARGETS clock_offset_check deskew_check DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY include/ DESTINATION include)
 install(DIRECTORY launch rviz DESTINATION share/${PROJECT_NAME})
 

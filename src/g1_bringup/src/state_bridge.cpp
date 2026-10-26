@@ -4,6 +4,7 @@
 // - /odommodestate (unitree_go/SportModeState, 500 Hz) -> TF odom -> pelvis, and /g1/odom (throttled)
 // - /utlidar/cloud_livox_mid360 (frame livox_frame)    -> /g1/cloud (robot stamp -> host clock)
 // - /utlidar/imu_livox_mid360 (EMPTY frame_id)         -> /g1/imu (robot stamp -> host clock, frame livox_imu)
+// - same cloud, deskewed to the scan end               -> /g1/cloud_deskewed (only while someone subscribes)
 //
 // The cloud (~20k points, ~440 KB) is read with a Reliable subscription: a best-effort reader loses the whole
 // sample when one UDP fragment is dropped (measured on a loopback bag replay: 0 Hz best effort vs 9.3 Hz reliable).
@@ -13,9 +14,17 @@
 // host time with an offset tracked from the 200 Hz lidar IMU (ClockOffset). Stamping on receipt would be wrong for
 // the cloud: its stamp is the scan START (per-point `time` runs 0..100 ms), ~100 ms before it arrives.
 // /lowstate and /odommodestate carry no usable stamp, so joint states and odom TF are stamped on receipt.
+//
+// The robot's cloud is raw (no motion compensation). /g1/cloud keeps it raw (LIO packages deskew themselves).
+// /g1/cloud_deskewed: every point in the lidar frame at the scan END, stamped with the scan end, fields x y z
+// intensity, like FAST-LIO2 (deskew.hpp). Rotation from the MID-360 gyro; translation of the lidar origin from leg
+// odometry = TF odom -> livox_frame (/odommodestate + waist joints through robot_state_publisher). The cloud waits
+// until the gyro covers the scan end and TF reaches it (FAST-LIO2 waits for IMU coverage too), at most
+// deskew_wait_timeout; then it is deskewed with what is there (gyro held, TF clamped to its latest time).
 #include <array>
 #include <cmath>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -26,11 +35,15 @@
 #include "sensor_msgs/msg/imu.hpp"
 #include "sensor_msgs/msg/joint_state.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
+#include "tf2/exceptions.h"
+#include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_broadcaster.h"
+#include "tf2_ros/transform_listener.h"
 #include "unitree_go/msg/sport_mode_state.hpp"
 #include "unitree_hg/msg/low_state.hpp"
 
 #include "g1_bringup/clock_offset.hpp"
+#include "g1_bringup/deskew.hpp"
 
 namespace g1_bringup
 {
@@ -90,13 +103,27 @@ public:
     base_frame_(declare_parameter("base_frame", "pelvis")),
     imu_frame_(declare_parameter("imu_frame", "livox_imu")),
     offset_window_ns_(static_cast<int64_t>(declare_parameter("clock_offset_window", 2.0) * 1e9)),
-    clock_offset_(offset_window_ns_ * 1e-9)
+    clock_offset_(offset_window_ns_ * 1e-9),
+    deskew_(declare_parameter("deskew", true)),
+    point_time_scale_(declare_parameter("point_time_scale", 1e-9)),  // MID-360 per-point `time` is in ns
+    leg_translation_(declare_parameter("deskew_leg_translation", true)),
+    // added to the point time when looking up the leg-odometry pose (its TF is stamped on receipt)
+    leg_time_offset_ns_(static_cast<int64_t>(declare_parameter("deskew_leg_time_offset", 0.0) * 1e9)),
+    wait_timeout_ns_(static_cast<int64_t>(declare_parameter("deskew_wait_timeout", 0.05) * 1e9)),
+    gyro_(1000000000LL)
   {
     js_pub_ = create_publisher<sensor_msgs::msg::JointState>("joint_states", 10);
     odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("g1/odom", 10);
     // Reliable publishers: compatible with both reliable (RViz default) and best-effort readers.
     cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("g1/cloud", 5);
     imu_pub_ = create_publisher<sensor_msgs::msg::Imu>("g1/imu", 5);
+    if (deskew_) {
+      cloud_deskewed_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("g1/cloud_deskewed", 5);
+      if (leg_translation_) {
+        tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
+        tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_, this);  // own spin thread
+      }
+    }
     tf_br_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
     lowstate_sub_ = create_subscription<unitree_hg::msg::LowState>(
@@ -114,12 +141,24 @@ public:
   }
 
 private:
+  struct Pending
+  {
+    std::unique_ptr<sensor_msgs::msg::PointCloud2> cloud;  // host-stamped copy of the raw cloud
+    int64_t robot_start;  // scan start, robot clock (gyro)
+    int64_t host_start;  // scan start, host clock (TF)
+    int64_t span;  // scan duration, ns
+  };
+
   static int64_t period_ns(double rate) {return rate > 0 ? static_cast<int64_t>(1e9 / rate) : 0;}
 
   void on_imu(sensor_msgs::msg::Imu::UniquePtr msg)
   {
     const int64_t receive_ns = now().nanoseconds();
     const int64_t stamp = stamp_ns(msg->header.stamp);
+    if (stamp != 0) {
+      const auto & w = msg->angular_velocity;
+      gyro_.add(stamp, {w.x, w.y, w.z});  // robot clock, like the cloud stamp
+    }
     int64_t host_ns = receive_ns;
     if (stamp != 0) {
       clock_offset_.add(receive_ns, stamp);
@@ -127,6 +166,7 @@ private:
       log_offset(receive_ns);
     }
     msg->header.stamp = rclcpp::Time(host_ns, RCL_ROS_TIME);
+    try_deskew(false);
     // The MID-360 IMU publishes no frame_id and no orientation (all-zero quaternion); acceleration is
     // in g (Livox convention, as FAST-LIO etc. expect), angular velocity in rad/s. Kept as is.
     msg->header.frame_id = imu_frame_;
@@ -136,14 +176,100 @@ private:
 
   void on_cloud(sensor_msgs::msg::PointCloud2::UniquePtr msg)
   {
-    auto host_ns = clock_offset_.to_host_ns(stamp_ns(msg->header.stamp));
+    const int64_t robot_ns = stamp_ns(msg->header.stamp);
+    auto host_ns = clock_offset_.to_host_ns(robot_ns);
     if (!host_ns) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
         "dropping cloud: no clock offset yet (no /utlidar/imu_livox_mid360)");
       return;
     }
     msg->header.stamp = rclcpp::Time(*host_ns, RCL_ROS_TIME);
+    if (cloud_deskewed_pub_ && cloud_deskewed_pub_->get_subscription_count() > 0) {
+      try_deskew(true);  // a previous scan still waiting: deskew it with what is there
+      double span = 0.0;
+      const std::string err = scan_span(*msg, point_time_scale_, span);
+      if (err.empty()) {
+        pending_ = Pending{std::make_unique<sensor_msgs::msg::PointCloud2>(*msg), robot_ns, *host_ns,
+          static_cast<int64_t>(span * 1e9)};
+        try_deskew(false);
+      } else {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "not deskewing cloud: %s", err.c_str());
+      }
+    }
     cloud_pub_->publish(std::move(msg));
+  }
+
+  // Deskews the pending cloud once the gyro covers its scan end and TF reaches it (or when forced / timed out).
+  void try_deskew(bool force)
+  {
+    if (!pending_) {
+      return;
+    }
+    const auto & p = *pending_;
+    const int64_t end_host = p.host_start + p.span;
+    const std::string & lidar_frame = p.cloud->header.frame_id;
+    const bool gyro_ok = !gyro_.empty() && gyro_.last_ns() >= p.robot_start + p.span;
+    const bool tf_ok = !tf_buffer_ ||
+      tf_buffer_->canTransform(odom_frame_, lidar_frame, rclcpp::Time(end_host + leg_time_offset_ns_, RCL_ROS_TIME));
+    if (!force && !(gyro_ok && tf_ok) && now().nanoseconds() - end_host < wait_timeout_ns_) {
+      return;
+    }
+    Translation trans;
+    std::string why;
+    const bool have_trans = tf_buffer_ && leg_odometry_translation(p, trans, why);
+    if (tf_buffer_ && !have_trans) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "deskew without leg-odometry translation: %s",
+        why.c_str());
+    }
+    auto out = std::make_unique<sensor_msgs::msg::PointCloud2>();
+    const std::string err = deskew_to_end(*p.cloud, *out, p.robot_start, gyro_, point_time_scale_,
+        have_trans ? &trans : nullptr);
+    if (err.empty()) {
+      out->header.frame_id = lidar_frame;
+      out->header.stamp = rclcpp::Time(end_host, RCL_ROS_TIME);
+      cloud_deskewed_pub_->publish(std::move(out));
+    } else {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "not deskewing cloud: %s", err.c_str());
+    }
+    pending_.reset();
+  }
+
+  // Lidar origin over the scan from TF (odom -> lidar frame), every 5 ms, in the scan-end lidar frame relative to
+  // the scan end. Times past the latest TF are clamped to it (held position).
+  bool leg_odometry_translation(const Pending & p, Translation & trans, std::string & why)
+  {
+    const std::string & lidar_frame = p.cloud->header.frame_id;
+    try {
+      const int64_t latest = rclcpp::Time(
+        tf_buffer_->lookupTransform(odom_frame_, lidar_frame, tf2::TimePointZero).header.stamp).nanoseconds();
+      auto origin = [&](int64_t t, Mat3 * rot) {
+          const auto tf = tf_buffer_->lookupTransform(odom_frame_, lidar_frame,
+              rclcpp::Time(std::min(t + leg_time_offset_ns_, latest), RCL_ROS_TIME));
+          const auto & q = tf.transform.rotation;
+          if (rot) {
+            *rot = {1 - 2 * (q.y * q.y + q.z * q.z), 2 * (q.x * q.y - q.w * q.z), 2 * (q.x * q.z + q.w * q.y),
+              2 * (q.x * q.y + q.w * q.z), 1 - 2 * (q.x * q.x + q.z * q.z), 2 * (q.y * q.z - q.w * q.x),
+              2 * (q.x * q.z - q.w * q.y), 2 * (q.y * q.z + q.w * q.x), 1 - 2 * (q.x * q.x + q.y * q.y)};
+          }
+          const auto & v = tf.transform.translation;
+          return Vec3{v.x, v.y, v.z};
+        };
+      Mat3 r_end;
+      const Vec3 o_end = origin(p.host_start + p.span, &r_end);
+      const size_t n = static_cast<size_t>(p.span / static_cast<int64_t>(trans.step_s * 1e9)) + 2;
+      trans.t.resize(n);
+      for (size_t k = 0; k < n; ++k) {
+        const Vec3 o = origin(p.host_start + static_cast<int64_t>(k * trans.step_s * 1e9), nullptr);
+        const Vec3 d{o[0] - o_end[0], o[1] - o_end[1], o[2] - o_end[2]};
+        trans.t[k] = {r_end[0] * d[0] + r_end[3] * d[1] + r_end[6] * d[2],  // R_end^T d
+          r_end[1] * d[0] + r_end[4] * d[1] + r_end[7] * d[2],
+          r_end[2] * d[0] + r_end[5] * d[1] + r_end[8] * d[2]};
+      }
+      return true;
+    } catch (const tf2::TransformException & e) {
+      why = e.what();
+      return false;
+    }
   }
 
   void log_offset(int64_t receive_ns)
@@ -240,6 +366,15 @@ private:
   const std::string imu_frame_;
   const int64_t offset_window_ns_;
   ClockOffset clock_offset_;
+  const bool deskew_;
+  const double point_time_scale_;
+  const bool leg_translation_;
+  const int64_t leg_time_offset_ns_;
+  const int64_t wait_timeout_ns_;
+  GyroBuffer gyro_;
+  std::optional<Pending> pending_;
+  std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::unique_ptr<tf2_ros::TransformListener> tf_listener_;
   std::optional<int64_t> first_receive_ns_;
   std::optional<int64_t> logged_offset_ns_;
   int64_t last_js_ns_{0};
@@ -248,6 +383,7 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr js_pub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_deskewed_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_br_;
   rclcpp::Subscription<unitree_hg::msg::LowState>::SharedPtr lowstate_sub_;

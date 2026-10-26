@@ -56,3 +56,37 @@ F1–F3 (description, TF/joints, lidar + IMU relay) done and verified offline on
 - This host's Claude Code session inherits G1_DDS=loopback / ROS_DOMAIN_ID=91: robot runs need `G1_DDS=robot`.
 - `G1_DDS=robot ./init.sh --robot` passes: all rates (cloud 10.0 Hz, imu 200.0 Hz), all TF chains, cloud receipt −
   stamp 101.0 ms, imu 0.4 ms, g1_container 7.0 % of a core, clock offset +1970.836 s (bags: 1969.2, 1970.3).
+
+### 2026-10-26 — deskewed cloud (F8) + state-estimation findings
+- User asked whether the MID-360 points are raw. Verified on the walking bag: rotating points by k x the gyro
+  rotation at their per-point time, the half-scan consistency is best at k = 1 (185/251 turning scans) → raw.
+  Per-point `time` is ns.
+- How the G1 estimates state: /odommodestate is IMU + legs only (lidar ICP between the still ends of both bags:
+  hanging yaw drift 0.8° in 160 s while the lidar sees 0.06°; walking 1.9° yaw / 3 cm after 11 m). No onboard LIO,
+  /slam_info is telemetry. Explained LIO→pelvis via the waist chain and map→odom layering (not implemented: scope).
+- F8: `deskew.hpp` (GyroBuffer + deskew_rotation, 0.1 ms grid, robot-clock stamps) in StateBridge →
+  /g1/cloud_deskewed (only while subscribed). `deskew_check` + scripts/test_deskew.py (exact vs NumPy, 0.001 mm;
+  turning half-NN 12.09 → 10.22 cm) in init.sh. RViz shows the deskewed cloud by default (raw display kept, off).
+- User: leg odometry instead of / with the IMU? Real bag (half-NN, 5 methods): gyro rotation beats leg rotation
+  (10.24 vs 10.44 cm turning); leg translation helps when walking (5.60 → 5.35); leg 6-DoF worse than gyro.
+  The half-NN proxy is blind to translation (shown on synthetic data).
+- User: synthetic ground truth → scripts/sim_deskew_bench.py (oracle error 0.00): median/p95 error raw 4.0/13.4 cm,
+  gyro rot 0.85/1.65, gyro rot + leg trans 0.47/0.82, leg 6-DoF 0.67/1.56. With 8 ms gyro delay + 25 ms leg lag:
+  0.93 / 0.66 / 1.19. At 2x speed: raw 7.9, gyro 1.65, gyro + leg 0.50. → next: add leg-odometry translation.
+- Gate flake found: cloud stamp age median ~200 ms = UDP receive-buffer overflow on loopback (rmem_max 208 KB;
+  2487/52693 packets dropped in one run) + Reliable repair at the 100 ms heartbeat. check_live now gates on p10.
+  Real fix needs sudo (rmem_max + Cyclone SocketReceiveBufferSize): left to the user. Reading both clouds in
+  check_live dropped raw to 7.7 Hz → the deskewed cloud is checked in a second 3 s window. init.sh passes.
+
+### 2026-10-26 (cont.) — deskew: gyro rotation + leg odometry, FAST-LIO2 convention
+- User: use gyro rotation + leg odometry; reference = scan end like FAST-LIO2; FAST-LIO2-like fields.
+- deskew.hpp: deskew_to_end() (points into the scan-END frame: G(T)^T G(t) p + t_end(t)), output x y z intensity
+  (FAST-LIO2 publishes PointXYZINormal; the normals are unused, curvature = time). Bridge: cloud held until the gyro
+  covers the scan end and TF odom -> livox_frame reaches it (≤ 50 ms timeout; FAST-LIO2 waits for IMU coverage too);
+  translation = lidar origin from TF every 5 ms. Params deskew_leg_translation, deskew_leg_time_offset (0),
+  deskew_wait_timeout.
+- Same method as FAST-LIO2 UndistortPcl for rotation (backward per point to the scan end, IMU covering the scan);
+  velocity/acceleration integration replaced by leg-odometry positions.
+- Evidence: C++ = NumPy 0.001 mm; synthetic ground truth 0.39/0.65 cm (median/p95) vs rotation-only 0.82/1.54 and
+  raw 4.07/13.15; end-to-end pipeline = independent FK reconstruction to 0.6 mm (sign-flip would be 38 mm).
+  Deskewed cloud arrives ~30 ms after the scan end (TF wait); +1.4 % CPU. init.sh passes; RViz OK.
